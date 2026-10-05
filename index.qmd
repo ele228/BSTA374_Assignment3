@@ -1,0 +1,700 @@
+---
+title: "Exercise 3 --- Point Patterns in Space and Space-Time"
+subtitle: "BSTA 374 · 25 points · Due Sunday, October 4, 2026, 11:59 pm"
+author: "Elizabeth Ehrhardt · Lehigh University"
+date: last-modified
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    toc-location: left
+    toc-title: "On this page"
+    number-sections: false
+    code-copy: true
+    highlight-style: github
+    embed-resources: true
+  pdf:
+    papersize: letter
+    geometry:
+      - margin=1in
+    toc: false
+    colorlinks: true
+    code-overflow: wrap
+prefer-html: true
+execute:
+  eval: true
+  echo: true
+---
+
+## What this exercise is
+
+The largest lab of the semester. You will decide whether a set of case locations is clustered, at what spatial
+scale, where the intensity is highest, and whether the clustering is also
+concentrated in *time* --- which is a different claim, and the one that matters
+for an outbreak.
+
+**Data.** Two files, posted with this exercise. Put them in a `data/` folder
+beside your `.qmd`.
+
+| File | What it holds |
+|---|---|
+| `dengue_cases_sim.csv` | 500 simulated dengue cases: `case_id`, `onset_date`, `report_date`, `neighborhood`, `age_group`, `lon`, `lat` |
+| `study_area.geojson` | the study-area boundary polygon |
+
+These are **simulated** data modelled on a dengue surveillance setting. Nobody's
+health information is involved, and the generating process is known --- which
+means your conclusions can be checked.
+
+Each part ends with **starting code**: copy it, fill in the blanks marked
+`______`, and adapt. It is scaffolding, not a solution.
+
+::: {.callout-important}
+## Submission
+Two things. Submit `LASTNAME_FI_Exercise3.qmd` --- the source --- to Course Site,
+with your name in the document header. And publish the rendered HTML to your
+semester GitHub repository, then paste the live URL into the Course Site
+submission --- Part H is that second step, and it is the one that carries the
+point.
+
+**Due Wednesday, October 1, 2026 at 11:59 pm.** Late work loses 20% per day
+unless you arrange something with me in advance.
+:::
+
+::: {.callout-warning}
+## Reproducibility is graded
+Restart R and render from a clean session before submitting. Several parts
+involve simulation --- set a seed at the top and use it, or your numbers will
+change between the render you checked and the render I grade.
+:::
+
+```{r}
+#| label: setup
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(spatstat)
+library(splancs)      # space-time K function
+library(plotly)       # space-time cube
+library(scatterplot3d)
+
+set.seed(800098279)      # your student ID works
+```
+
+---
+
+## Part A --- From CSV to `ppp` (3 points)
+
+Everything after this part runs on a `ppp` object, so it is worth knowing what
+one is. `spatstat` does not work with `sf`. A **`ppp`** ("planar point pattern")
+holds two things: the coordinates of the events, and a **window** --- the region
+within which they could have been observed. Both are required, because every
+statistic in this lab is a comparison against what would be expected inside that
+window: the intensity is $n$ divided by its area, the expected nearest-neighbour
+distance depends on that intensity, and the edge corrections depend on its shape.
+Give `spatstat` the wrong window and every number below changes without any
+warning.
+
+1. Read the case file and the boundary. Report how many cases you have and what
+   one row represents.
+   
+   I have 500 cases, and each row represents an incidence of dengue fever.
+   
+2. Convert the cases to an `sf` object in **EPSG:4326**, then project both the
+   cases and the boundary to **EPSG:32618** (UTM 18N, metres). One sentence on
+   why the analysis cannot be done in degrees.
+   
+   The analysis cannot be done in degrees because it needs to be done in a distance unit.
+   
+3. Build a `ppp` whose window is the study-area polygon, then print it. Report
+   the number of events and the intensity in cases per km².
+   
+   The number of events is 500, and the intensity in cases per km^2 is 2.626777.
+   
+   
+4. Replace the polygon window with the bounding box of the cases
+   (`Window(pp) <- owin(range(x), range(y))`) and recompute the intensity. Two or
+   three sentences on how much it changed and why the choice of window is a
+   modelling decision rather than a technicality. Then go back to the polygon.
+
+The intensity of this new window is 2.348006. Since the bounding box is lager than the city limits, there is a lower intensity of the 500 events and a longer expected nearest neighbor difference. The choice of the window is a modelling decision rather than a technicality because it shows that there is a nuance of where the case could have happened when interpreting the map.
+   
+5. Map the cases over the boundary.
+
+### Starting code
+
+```{r}
+#| label: a-starter
+
+cases_raw <- read.csv("C:/Users/ele228/Downloads/dengue_cases_sim.csv", stringsAsFactors = FALSE)
+area      <- st_read("C:/Users/ele228/Downloads/study_area.geojson", quiet = TRUE) |> st_transform(32618)
+
+cases <- cases_raw |>
+  mutate(onset_date  = as.Date(onset_date),
+         report_date = as.Date(report_date)) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326) |>
+  st_transform(32618)
+
+win <- as.owin(st_geometry(area))       # the observation window
+pp  <- as.ppp(st_geometry(cases))       # coordinates only, with a bounding box
+Window(pp) <- win                       # attach the real window
+
+pp                                      # print it: n, window type, extent
+npoints(pp)
+intensity(pp) * 1e6                     # cases per km^2
+
+#creating a different window
+pp
+c(n = npoints(pp),
+  area_km2 = as.numeric(st_area(area)) / 1e6,
+  per_km2 = intensity(pp) * 1e6)
+
+pp2 <- pp
+Window(pp2) <- owin(range(st_coordinates(cases)[,1]),
+                    range(st_coordinates(cases)[,2]))
+intensity(pp2) * 1e6
+
+#Map
+ggplot() +
+    geom_sf(data = area, fill = "grey97", color= "grey50") + 
+    geom_sf(data = cases, aes(color = neighborhood), size = 0.8, alpha = 0.7) +
+    labs(color=NULL) + theme_void(base_size=10)
+```
+
+---
+
+## Part B --- Quadrat analysis (3 points)
+
+1. Lay a 6 × 6 grid over the window, map the counts, and compute the mean,
+   variance and **variance-to-mean ratio** from the counts by hand --- not from a
+   canned function. Show the arithmetic. 
+   
+   VMR is far above 1 with a value of 41.88251. The mean is 13.88889. The variance is 581.70159.
+   
+2. State what the VMR is being compared against, and why: under complete spatial
+   randomness the counts are Poisson, and a Poisson distribution has variance
+   equal to its mean. Report where your value sits relative to 1.
+   
+   Relative to 1, my VMR value is far above- meaning that the counts are more variable than a Poisson calculation would have considered. In Poisson, there is the variance equals mean property, which is where this comes from.
+   
+3. Repeat the VMR for at least four grid resolutions and plot VMR against cells
+   per side. Three or four sentences: what does the shape of that curve say about
+   the claim "this pattern is clustered"?
+   
+  The variance-to-mean ratio stays far above the random-pattern value of 1 at every grid size (3 to 12 cells per side), so the pattern is clustered no matter what scale you look at it. It peaks around 6 cells per side, which suggests that's roughly the scale where the clusters themselves live: cells that size line up best with the clumps, so some cells catch whole clusters while others catch none. Smaller cells split each cluster across many quadrats, and larger cells blend several clusters together, which is why the ratio drops off on either side. The slow decline rather than a sharp drop means the clustering shows up across a range of scales, not just one.
+   
+   
+
+### Starting code
+
+```{r}
+#| label: b-starter
+
+qc  <- quadratcount(pp, nx = 6, ny = 6)
+cnt <- as.vector(qc)
+
+c(k = length(cnt), mean = mean(cnt), var = var(cnt), VMR = var(cnt)/mean(cnt))
+
+grid_n <- c(3, 4, 6, 8, 12)
+vmr <- sapply(grid_n, function(k) {
+  v <- as.vector(quadratcount(pp, nx = k, ny = k))
+  var(v) / mean(v)
+})
+
+data.frame(cells = grid_n, vmr=vmr) |>
+  ggplot(aes(cells,vmr)) + 
+  geom_hline(yintercept = 1, linetype = 2, color="grey50") +
+  geom_line(color="firebrick") + geom_point(color="firebrick") +
+  labs(x="cells per side", y = "variance/mean") + theme_minimal()
+```
+```{r}
+#| label: b-map
+
+plot(pp, pch = 16, cex =0.3, cols= "grey76", main="")
+plot(qc, add = TRUE, col= "firebrick", cex = 0.8)
+
+```
+
+---
+
+## Part C --- Nearest-neighbour statistics (3 points)
+
+1. Compute `nndist()`, report the observed mean, and compute the CSR expectation
+   $E(d) = 1/(2\sqrt{\lambda})$ **by hand** from your intensity. Report the
+   Clark--Evans ratio $R$ and state the direction of the departure.
+   
+   The observed mean is 215.517. The CSR expectation is 308.502. The Clark Evans ratio is 0.699. The direction of the departure is showing clustering because the p value is 0.01.
+   
+2. Run `clarkevans.test()` with a Monte Carlo null. The window is an irregular
+   polygon, so the Donnelly correction is unavailable --- use
+   `correction = "cdf"` with `method = "MonteCarlo"`. One sentence on why an edge
+   correction is needed at all.
+   
+   An edge correction is needed because when an event happens at or near the border of the study area, they have neighbors that may be outside this boundary that never got observed. 
+   
+3. Plot the G function with a simulation envelope. Two or three sentences on what
+   G shows that the single ratio $R$ does not.
+   
+   G shows the full distribution and tells you at which distances the clustering operates. The observed curve rises well above the CSR envelope from about r= 20 to r=400. This means that far more points in that area have a neighbor within that range than expected. G also shows the departure fades at large r, where the curve merges into the envelope around 450 to 500, something a single R of 0.65 can't reveal. R is just one number where G is actually able to expand upon the range and concepts. 
+   
+### Starting code
+
+```{r}
+#| label: c-starter
+
+nnd    <- nndist(pp)
+lambda <- intensity(pp)
+d_exp  <- 0.5 / sqrt(lambda)                        # 1 / (2 sqrt(lambda))
+
+c(observed = mean(nnd), expected = d_exp, R = mean(nnd) / d_exp,
+                            zero_distances = sum(nnd== 0))
+
+clarkevans.test(pp, correction = "cdf", alternative = "clustered",
+                method = "MonteCarlo", nsim = 99)
+
+
+```
+
+```{r}
+#| label: c plot
+
+plot(envelope(pp, Gest, nsim = 99, verbose = FALSE), main = "", legend = FALSE)
+```
+
+---
+
+## Part D --- Ripley's K across scales (4 points)
+
+1. Estimate $K(r)$ with an edge correction, then plot the centred L function
+   $\hat{L}(r) - r$ against $r$.
+   
+   
+2. Add a **simultaneous** envelope (`global = TRUE`) from at least 99 CSR
+   simulations. State the distances over which the curve leaves the band.
+   
+   The curve leaves the band for almost the entire plotted range. It peaks around 800 m. 
+   
+3. Read a **characteristic scale** off the curve --- the $r$ at which the
+   departure peaks --- and translate it into something a public health officer
+   would recognise: a few city blocks, a neighbourhood, half the city.
+   
+   As stated, the peak is around 800m. That distance would be closest to a neighborhood- which is a cluster area small enough where a team of public health officers could work to reduce rates of dengue fever effectively. 
+   
+4. Three or four sentences: $K$ assumes the intensity is constant across the
+   window. Looking at your map from Part A, is that plausible here? Say what the
+   consequence is for reading the curve --- what else, besides interaction
+   between cases, could put it above the envelope.
+   
+   No, constant intensity is not plausible here, because the map shows four tight, dense clusters surrounded by a thin scatter of cases. The L(r) − r curve sits far above the CSR envelope at every distance and peaks near r = 800, so clustering is strongest at about 800 units (meters, if that is your CRS), roughly the size and spacing of the dense neighborhoods. K assumes stationarity, meaning the density is the same everywhere, and that is violated here, so the curve mixes together where people live, local risk conditions, and any real interaction between cases. Cases are clearly clustered at the neighborhood scale and beyond, but I can't say how much of that is interaction versus an uneven background, and K is only a partial fix because its intensity estimate can absorb some of the real clustering.
+
+::: {.callout-warning}
+`global = TRUE` with `nsim = 99` takes a minute or two. Develop with
+`nsim = 19`, raise it once, and do not re-render in a loop.
+:::
+
+### Starting code
+
+```{r}
+#| label: d-starter
+
+L <- Lest(pp, correction = "isotropic")
+plot(L, . - r ~ r, main = "", legend = FALSE)
+
+env <- envelope(pp, Lest, nsim = 99, correction = "isotropic",
+                global = TRUE, verbose = FALSE)
+plot(env, . - r ~ r, main = "", legend = FALSE)
+
+```
+
+```{r}
+#| label: d peak
+
+dat <- as.data.frame(env)
+peak <- dat$r[which.max(dat$obs - dat$r)]
+c(peak_r_m = peak, max_excess_m = max(dat$obs - dat$r))
+```
+---
+
+## Part E --- Kernel density estimation and bandwidth choice (4 points)
+
+K tells you *whether* and *at what distance*; it does not tell you *where*. That
+is what a kernel intensity surface is for.
+
+1. Estimate the intensity with `density.ppp()` and convert to **cases per km²**.
+   Map it with the cases drawn on top.
+   
+2. Produce the same surface at **three bandwidths** --- one clearly too small,
+   one clearly too large, and one you would defend --- on a **common colour
+   scale** so the panels are comparable. Two or three sentences on what changes
+   and what does not.
+   
+   As sigma grows from 150 to 2000 m, the hotspots go from sharp, bright peaks (reaching about 150) to faint blurs and finally to a nearly flat surface, because the same cases get spread over a wider area and the peak values drop. What stays the same is the locations of the hotspots (the upper, right, and left ones keep their positions, though the bottom one at 150 m appears as a looser group of small spots rather than one peak), and the total number of cases, which is just redistributed rather than changed. So bandwidth controls how much detail you see, not where the clusters are, and a sigma that is too small shows noise while one that is too large erases real structure.
+   
+3. Compare at least two automatic selectors (`bw.diggle()`, `bw.ppl()`,
+   `bw.scott()`). Report the values in metres, say which you adopt and why, and
+   note whether your answer to step 2 would change if you adopted a different one.
+   
+   Diggle is 168.69 m, ppl is 469.93 m, and scott is 1250.54 m. I adopt bw.ppl (about 470 m) because it falls in the middle: Diggle is so small that it makes the data look noisy, like the broken-up spots in the sigma = 150 m map, while Scott is so large that it blurs the clusters away, like the sigma = 2000 m map. PPL still shows all four hotspots clearly without too much noise, though it is a reasonable choice rather than a perfect one. My answer to step 2 would not change if I used a different selector, because the hotspots stay in the same places and only their sharpness changes.
+   
+   
+4. Three or four sentences on what this map is and is not. Where is the intensity
+   highest? What would you need in order to turn this surface into a statement
+   about **risk** rather than about counts, and what is the name of the quantity
+   you would compute instead?
+   
+  The intensity is highest above Aguablanca, and also has high spots at Siloe, Floralia, and El Retiro. It is maps of case density, not risk- showing neighborhoods where cases are numerous. Typically aligning with higher populous areas. In order to turn this surface into a statement about risks rather than counts, we would need to add a population at risk denominator. The name of the quantity I would compute instead is a relative risk surface. 
+
+::: {.callout-tip}
+## What earns full marks here
+Step 4, and the common colour scale in step 2. Two surfaces at different
+bandwidths with independently stretched legends look like different data; a
+reader cannot compare them, and neither can you.
+:::
+
+### Starting code
+
+
+
+```{r}
+#| label: e-starter
+
+sig <- bw.diggle(pp)
+c(diggle = bw.diggle(pp), ppl = bw.ppl(pp), scott = mean(bw.scott(pp)))
+
+kde <- density(pp, sigma = sig, eps = 50) * 1e6       # cases per km^2
+plot(kde, main = "", ribargs = list(las = 1))
+plot(Window(pp), add = TRUE, border = "grey40")
+points(pp, pch = 16, cex = 0.25, col = rgb(0, 0, 0, 0.35))
+
+
+```
+
+```{r}
+#| label: e
+#| fig-width: 10
+#| fig-height: 4
+
+sigmas <- c(150, 600, 2000)                   # too small, defensible, too large
+surf   <- lapply(sigmas, function(s) density(pp, sigma = s, eps = 50) * 1e6)
+zmax   <- max(sapply(surf, max))                      # one scale for all panels
+
+par(mfrow = c(1, 3))
+for (i in seq_along(surf))
+  plot(surf[[i]], main = paste0("sigma = ", sigmas[i], " m"), zlim = c(0, zmax), ribargs = list(las =1))
+```
+
+---
+
+## Part F --- Space-time kernel density (3 points)
+
+A single intensity surface pools six months. An outbreak is a hotspot that
+exists in some weeks and not others, and pooling hides exactly that.
+
+1. Split the cases into **monthly** patterns and estimate a kernel surface for
+   each, using **one bandwidth for all months** and **one colour scale for all
+   months**. Display them as small multiples.
+   
+   
+2. Two or three sentences on why both of those constraints are necessary, and
+   what a reader would wrongly conclude if each panel were scaled to its own
+   maximum.
+   
+   Both constraints are needed so that the only thing changing from panel to panel is the data. If each month had its own bandwidth, a month with fewer cases might be smoothed more than a busy month, so differences in how sharp or spread out the hotspots look would come from the smoothing choice and not from the actual pattern.A single shared bandwidth and a single shared color scale make brightness and sharpness directly comparable, so a reader can see real changes in where and how many cases occur over time.
+   
+   
+3. Name the months and locations where the intensity is high, and say which
+   hotspots persist across months and which appear and disappear.
+
+   Floralia has high intensity in February. Aguablanco has high intensity in March. Siloe has high intensity in May. El Retiro persists across every panel at a not as high intensity- the others disappear.
+   
+4. Build a **space-time cube**: an interactive 3D scatter with easting, northing
+   and day-of-study on the three axes, coloured by neighbourhood. Rotate it until
+   the structure is visible, then set a viewing angle that makes your point and
+   keep it. One or two sentences on what the cube shows that the small multiples
+   do not, and vice versa --- look in particular for the difference between a
+   compact blob and a vertical column.
+   
+   The cube shows the outbreaks as blob clusters within a 3D scale. El Retiro vertically spans the whole cube as it is present at all dates. The small multiples do not make it easy to compare across the different panels, while the cube is able to give a distinct sense of duration. The small multiples strength is that the geography is easier to interpret. 
+
+::: {.callout-warning}
+## plotly renders in HTML only
+The cube is an HTML widget: it appears in an HTML render and is silently dropped
+from a PDF one. The two chunks below are gated on `knitr::is_html_output()`, so
+whichever format you render gets a working figure. If you publish the HTML, keep
+`embed-resources: true` --- otherwise the widget lives in a `_files/` folder that
+has to travel with the page.
+:::
+
+::: {.callout-note}
+## If you want the proper estimator
+Steps 1--3 are a discretised space-time KDE: one spatial bandwidth, and a
+temporal "bandwidth" equal to one month, applied as a hard cut. The continuous
+version smooths in time as well, with a separate temporal bandwidth, and lives
+in the `sparr` package --- `spattemp.density()` with `h` and `lambda`, then
+`spattemp.slice()` to pull out time slices. Using it is worth up to **2 bonus
+points** if the monthly version is already complete and correct. Do not start
+here.
+:::
+
+### Starting code
+
+```{r}
+#| label: f-starter
+
+cases$month <- format(cases$onset_date, "%Y-%m")
+h <- 600                                  # one bandwidth, chosen in Part E
+
+by_month <- lapply(sort(unique(cases$month)), function(m) {
+  sub <- cases[cases$month == m, ]
+  p   <- ppp(st_coordinates(sub)[, 1], st_coordinates(sub)[, 2], window = Window(pp))
+  density(p, sigma = h, eps = 50) * 1e6
+})
+
+zmax <- max(sapply(by_month, max))        # common scale across months
+
+par(mfrow = c(2, 3), mar = c(1, 1, 2, 2))
+for (i in seq_along(by_month))
+  plot(by_month[[i]], main = sort(unique(cases$month))[i], zlim = c(0, zmax))
+
+xy  <- st_coordinates(cases)
+cube <- data.frame(E = xy[, 1], N = xy[, 2],
+                   day = as.numeric(cases$onset_date - min(cases$onset_date)),
+                   hood = cases$neighborhood)
+
+#| label: f-cube-html
+#| eval: !expr knitr::is_html_output()
+plotly::plot_ly(cube, x = ~E, y = ~N, z = ~day, color = ~hood,
+                type = "scatter3d", mode = "markers",
+                marker = list(size = 3, opacity = 0.75)) |>
+  plotly::layout(scene = list(xaxis = list(title = "easting (m)"),
+                              yaxis = list(title = "northing (m)"),
+                              zaxis = list(title = "day of study")))
+```
+
+
+
+```{r}
+#| label: f-cube-static
+#| eval: !expr isFALSE(knitr::is_html_output())
+
+scatterplot3d::scatterplot3d(cube$E, cube$N, cube$day, pch = 16, cex.symbols = 0.4,
+                             color = as.integer(factor(cube$hood)),
+                             xlab = "easting (m)", ylab = "northing (m)", zlab = "day")
+```
+
+---
+
+## Part G --- The space-time K function (4 points)
+
+Spatial clustering and space-time clustering are different claims. A
+neighbourhood with chronically high incidence is clustered in space in every
+month; an outbreak is clustered in space *and* time together. Diggle's space-time
+K function separates them by comparing the joint function with the product of the
+two marginals:
+
+$$
+D(s, t) = K_{st}(s, t) - K_s(s)\,K_t(t)
+$$
+
+$D = 0$ means space and time are independent --- cases may cluster spatially,
+temporally, or both, but not *jointly*. $D > 0$ is space-time interaction.
+
+1. Build the inputs `splancs` expects: a two-column matrix of projected
+   coordinates, a numeric time vector (days since the first onset), and the
+   boundary as a matrix of vertices.
+   
+   
+2. Compute $K_s$, $K_t$ and $K_{st}$ with `stkhat()`. Justify your choice of
+   spatial distances `s` and time lags `tm` in one sentence each --- what scales
+   are plausible for a mosquito-borne disease?
+   
+   s could be up to 3,000 m because that is the scale we found in part D. tm would be up to 10 weeks because of the incubation time for a mosquito borne illness. 
+   
+   
+3. Plot **both** $D(s,t)$ and the standardised version
+   $D_0(s,t) = K_{st}/(K_s K_t) - 1$. One or two sentences on why the two
+   surfaces have different shapes: $K$ functions are cumulative, so $D$
+   accumulates and then flattens, while $D_0$ measures the *proportional* excess
+   and falls away once you leave the scale of the clustering. This is the same
+   move as plotting $\hat{L}(r) - r$ instead of $\hat{K}(r)$ in Part D.
+   
+   The two surfaces differ because D works on the raw cumulative scale and D₀ divides out the baseline.
+   
+4. A surface is hard to read against nothing. Build a **permutation envelope**:
+   shuffle the onset dates across the fixed locations, recompute $D_0$, repeat 99
+   times, and take the upper 97.5% quantile at each $(s, t)$. Then plot $D_0$
+   against $s$ as a curve per time lag, with its envelope --- the space-time
+   analogue of the envelope you used for $L$. Shuffling the dates destroys any
+   space-time interaction while leaving both marginal patterns exactly as
+   observed, which is the correct null here.
+   
+   
+5. Read the peak off those curves --- a distance and a lag --- and say what the
+   pair means for this disease.
+   
+   D₀(s,t) peaks at a short distance, about 500 m or less, and a short lag, about 3 days or less. There, case pairs are roughly six times more common than they would be if locations and dates were independent (D₀ ≈ 5). The excess shrinks as the lag window widens: D₀ is about 4.5 for 9 days, 2.5 for 21 days, and about 1 for 42 days. The permutation test agrees: the observed statistic lies far outside the distribution from shuffled dates, so the space-time interaction is not due to chance.
+
+For dengue, this means cases occur close together in both place and time, within a few hundred meters and a few days, which is consistent with local transmission around homes and blocks. The monthly table shows where this comes from: the clustering is driven by short, intense bursts in single neighborhoods (Floralia in February, Aguablanca in March, Siloe in May), each of which packs many cases into the same small area and the same few weeks.
+   
+   
+6. Run `stmctest()` for a single global p-value. It sums the residuals
+   $\hat{D}(s,t)$ over the whole grid into one statistic $U$, recomputes it under
+   permuted dates, and returns the observed value as `$t0` and the permuted ones
+   as `$t`. Report the p-value as
+   $(1 + \#\{t \geq t_0\}) / (1 + B)$ and plot the null distribution with the
+   observed value marked. One sentence on what this test adds to the curves in
+   step 4, and what it cannot tell you.
+   
+   The global test gives a single formal yes/no that space-time interaction exists at all, since the observed U lies far outside the permuted distribution (p = 1/(1 + B)), but it cannot say at what distance or lag the interaction occurs, nor whether it comes from transmission rather than localized outbreak events or uneven population density.
+   
+7. Five or six sentences. Tabulate cases by neighbourhood and month. At least one
+   neighbourhood contributes to the spatial clustering of Part D without
+   contributing to the space-time interaction here. Identify it, explain what
+   distinguishes it from the others, and say what each of the two patterns would
+   mean for someone deciding where to send a vector-control team this week.
+   
+   El Retiro is the neighbourhood that adds to the spatial clustering without adding to the space-time interaction. It has 97 cases, nearly as many as Floralia, so it is a dense spot on the Part D map, but its cases are spread almost evenly across all six months (13 to 24 per month). Aguablanca, Floralia, and Siloe are different: each packs most of its cases into one month (105, 72, and 84), so their cases are close in both space and time, and those burst pairs are what drive the space-time statistic. Because El Retiro's cases are close in space but not bunched in time, shuffling the dates barely changes its contribution, so it adds to K but not to the interaction. For a vector-control team this week, the burst pattern says an outbreak is flaring and fading quickly, so you would go to whichever neighbourhood is spiking right now, since cases there are tightly linked and a fast response can cut transmission. El Retiro's pattern says a persistent, ongoing source of risk (such as breeding sites or crowded housing), so it calls for sustained, routine control rather than a one-time surge, even though it never looks like an emergency in any single month.
+   
+   
+
+::: {.callout-warning}
+## Never report $p = 0$
+`mean(mc$t >= mc$t0)` returns 0 when no permutation beats the observed value,
+and 0 is not a p-value --- with $B$ permutations you cannot resolve anything
+below $1/(B+1)$. Always add the observed value to both counts, as above. With
+999 permutations the smallest reportable value is 0.001, and the honest phrasing
+is "$p \leq 0.001$", not "$p < 0.0001$".
+:::
+
+::: {.callout-note}
+`splancs` is old and its arguments are terse: `stkhat(pts, times, poly, tlimits,
+s, tm)`, where `tlimits` is the time range, `s` the spatial distances and `tm`
+the time lags. `?stkhat` and `?stmctest` are short. A **Knox test** on a distance
+and time threshold of your choosing is an acceptable substitute if you defend
+both thresholds --- say explicitly if you go that route.
+:::
+
+### Starting code
+
+```{r}
+#| label: g-starter
+
+xy    <- st_coordinates(cases)
+pts   <- as.points(xy[, 1], xy[, 2])
+times <- as.numeric(cases$onset_date - min(cases$onset_date))
+bdry  <- st_coordinates(area)[, 1:2]         # drop the closing vertex if duplicated
+
+s  <- c(seq(50, 1000, by = 50), seq(1200, 3000, by = 200))   # finer near the origin
+tm <- seq(3, 70, by = 3)                     # days
+
+stk <- stkhat(pts, times, bdry, c(0, max(times)), s, tm)
+
+D  <- stk$kst - outer(stk$ks, stk$kt)                  # raw excess
+D0 <- stk$kst / outer(stk$ks, stk$kt) - 1              # standardised excess
+
+par(mfrow = c(1, 2))
+persp(s, tm, D,  theta = 30, phi = 25,
+      xlab = "distance (m)", ylab = "lag (days)", zlab = "D")
+persp(s, tm, D0, theta = 30, phi = 25,
+      xlab = "distance (m)", ylab = "lag (days)", zlab = "D0")
+
+# permutation envelope: shuffle the dates, keep the locations
+B <- 99
+perm <- replicate(B, {
+  st <- stkhat(pts, sample(times), bdry, c(0, max(times)), s, tm)
+  st$kst / outer(st$ks, st$kt) - 1
+})
+hi <- apply(perm, c(1, 2), quantile, 0.975)
+
+k <- c(1, 3, 7, 14)                          # lags to show
+matplot(s, D0[, k], type = "l", lty = 1, lwd = 2, xlab = "distance s (m)",
+        ylab = expression(D[0](s, t)))
+matlines(s, hi[, k], lty = 3, lwd = 1)
+abline(h = 0, col = "grey")
+legend("topright", legend = paste("lag <=", tm[k], "d"), lty = 1, lwd = 2,
+       col = 1:4, bty = "n")
+
+mc <- stmctest(pts, times, bdry, c(0, max(times)), s, tm, nsim = 999, quiet = TRUE)
+
+(1 + sum(mc$t >= mc$t0)) / (1 + length(mc$t))   # global Monte Carlo p-value
+
+hist(mc$t, xlim = range(c(mc$t, mc$t0)), xlab = "U under permuted dates", main = "")
+abline(v = mc$t0, col = "firebrick", lwd = 2)
+
+table(cases$neighborhood, cases$month)
+```
+
+---
+
+## Part H --- Rendering and publication (1 point)
+
+The `.qmd` is the submission, but the rendered page is what anyone else can
+actually read --- and by the end of the semester this repository is your
+portfolio.
+
+1. Render to **HTML** from a clean session, with the seed set and every package
+   loaded explicitly, then commit both the `.qmd` and the rendered output to your
+   semester repository, in the folder your site is built from.
+2. Push, wait for GitHub Pages to rebuild, and **open the published URL yourself**
+   to check it. A page that renders locally and 404s online is not submitted.
+3. Put the URL of the published page in your document header and in your Course
+   Site submission.
+
+The point is for a page that works: rendered, pushed, and reachable at the URL
+you supply.
+
+::: {.callout-warning}
+## Two things that break the published page
+`embed-resources: true` is already set in the header --- keep it. Without it the
+`plotly` cube in Part F lives in a `_files/` folder that must be committed
+alongside the HTML, and forgetting it gives a page with a blank space where the
+cube should be.
+
+Relative paths to `data/` work locally because your working directory is the
+`.qmd`'s folder. They will also work on the site *as long as you commit the data
+files*. Check the live page, not the local preview.
+:::
+
+---
+
+## AI use {.unnumbered}
+
+End your document with a short **AI use note**: which tools, what for, at which
+stage. Two or three sentences.
+
+I used Claude AI mainly to help with my answers in part G, to help me analyze the graphs that were being produced by the started code. 
+
+AI use is unrestricted in this course and costs you nothing, but you must be able
+to explain every line you hand in. The note carries no points --- it is simply
+expected, the way a methods section is.
+
+---
+
+## Rubric
+
+| Part | What is assessed | Points |
+|---|---|---|
+| **A** | Correct import, CRS and window; `ppp` built and explained; effect of the window argued | 3 |
+| **B** | VMR computed from counts; benchmark of 1 explained; resolution sweep interpreted | 3 |
+| **C** | $E(d)$ derived and $R$ interpreted; Monte Carlo test correct; G compared with $R$ | 3 |
+| **D** | Centred L with a simultaneous envelope; characteristic scale read and translated; stationarity assumption discussed | 4 |
+| **E** | Surface in interpretable units; three bandwidths on a common scale; selectors compared; density-is-not-risk argument | 4 |
+| **F** | Monthly surfaces with common bandwidth and scale; persistent vs transient hotspots named; space-time cube | 3 |
+| **G** | Space-time K computed; $D_0$ with a permutation envelope; peak distance and lag read off; the spatial-only neighbourhood identified and the operational difference explained | 4 |
+| **H** | Clean render to HTML, published to GitHub Pages; working URL supplied | 1 |
+| | **Total** | **25** |
+
+Writing counts for roughly 15% within each part --- more than in Exercise 1,
+because more of this lab is interpretation. A submission that is all code and no
+sentences cannot score above about 50%.
+
+---
+
+## Getting help
+
+- Office hours, or email with the code and the exact error message.
+- `splancs` in Part G is the one place where the documentation is thin. Start
+  early enough that you can ask.
+- Stuck for more than thirty minutes on something mechanical: ask rather than
+  persevere.
